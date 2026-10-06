@@ -141,12 +141,15 @@ async def fetch_trudvsem(client: httpx.AsyncClient, query: str, remote: bool, da
         params["modifiedFrom"] = since.strftime("%Y-%m-%dT%H:%M:%SZ")
     r = await client.get("https://opendata.trudvsem.ru/api/v1/vacancies", params=params)
     _ok(r)
-    out = []
-    for rec in ((r.json().get("results") or {}).get("vacancies") or []):
+    data = r.json()
+    recs = (data.get("results") or {}).get("vacancies") or []
+    out, skipped = [], 0
+    for rec in recs:
         it = rec.get("vacancy") or {}
         title = it.get("job-name") or ""
         # отдельного фильтра удалёнки в этом API нет: смотрим на график работы и название
         if remote and not re.search(r"удален|дистанц|remote", _norm((it.get("schedule") or "") + " " + title)):
+            skipped += 1
             continue
         lo, hi = it.get("salary_min"), it.get("salary_max")
         out.append(Vacancy(
@@ -158,6 +161,9 @@ async def fetch_trudvsem(client: httpx.AsyncClient, query: str, remote: bool, da
             source="Работа России",
             published=_parse_dt(it.get("creation-date")),
         ))
+    scheds = sorted({(x.get("vacancy") or {}).get("schedule") or "—" for x in recs})[:6]
+    print(f"Работа России «{query}»: в API всего {(data.get('meta') or {}).get('total')}, "
+          f"в ответе {len(recs)}, отсеяно как не удалённая работа {skipped}; графики: {scheds}")
     return out
 
 
@@ -267,18 +273,31 @@ async def collect(query: str, remote: bool = False, use_excludes: bool = True, d
             log.warning("%s failed: %r", name, res)
             errors.append(name)
             continue
+        c = {"got": len(res), "stale": 0, "off": 0, "minus": 0, "dup": 0, "ok": 0}
+        off_examples = []
         for v in res:
             # страховка: даже если сайт не умеет фильтр по дате, старое отсекаем сами
             if cutoff and v.published and v.published < cutoff:
+                c["stale"] += 1
                 continue
             if use_excludes and config.STRICT_TITLE and not any(matches_query(v, q) for q in queries):
-                continue  # не по теме: сайт отдал лишнее
+                c["off"] += 1  # не по теме: сайт отдал лишнее
+                if len(off_examples) < 3:
+                    off_examples.append(v.title)
+                continue
             if use_excludes and is_excluded(v):
                 hidden += 1
+                c["minus"] += 1
                 continue
-            if v.key not in seen:  # дедупликация
-                seen.add(v.key)
-                vacancies.append(v)
+            if v.key in seen:  # дедупликация
+                c["dup"] += 1
+                continue
+            seen.add(v.key)
+            vacancies.append(v)
+            c["ok"] += 1
+        print(f"{name}: получено {c['got']} → старше срока {c['stale']}, не по теме {c['off']}, "
+              f"минус-слова {c['minus']}, дубли {c['dup']} → осталось {c['ok']}"
+              + (f"; примеры «не по теме»: {off_examples}" if off_examples else ""))
     # свежие сверху; вакансии без даты — в конец
     epoch = datetime.min.replace(tzinfo=timezone.utc)
     vacancies.sort(key=lambda v: v.published or epoch, reverse=True)
