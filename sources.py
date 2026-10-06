@@ -43,6 +43,13 @@ def _money(a, b, cur) -> str:
     return (" ".join(parts) + f" {cur or ''}").strip() or "не указана"
 
 
+def _hh_headers() -> dict:
+    h = {"HH-User-Agent": UA}
+    if os.getenv("HH_TOKEN"):  # токен приложения с dev.hh.ru, если он есть
+        h["Authorization"] = "Bearer " + os.environ["HH_TOKEN"]
+    return h
+
+
 def _ok(r: httpx.Response) -> None:
     """Ошибка с кодом и началом ответа сайта (видно в логах Actions)."""
     if r.is_error:
@@ -59,7 +66,7 @@ async def fetch_hh(client: httpx.AsyncClient, query: str, remote: bool, days: in
     variants = [{"work_format": "REMOTE"}, {"schedule": "remote"}] if remote else [{}]
     for extra in variants:
         r = await client.get("https://api.hh.ru/vacancies", params={**params, **extra},
-                             headers={"HH-User-Agent": UA})
+                             headers=_hh_headers())
         if r.status_code != 400:
             break
     _ok(r)
@@ -126,7 +133,36 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, remote: bool, da
     ) for it in (r.json().get("objects") or [])]
 
 
-ALL_SOURCES = {"hh.ru": fetch_hh, "Habr Career": fetch_habr, "SuperJob": fetch_superjob}
+async def fetch_trudvsem(client: httpx.AsyncClient, query: str, remote: bool, days: int = 0):
+    """«Работа России» — государственный портал, открытое API без ключа."""
+    params = {"text": query, "limit": 100, "offset": 0}
+    if days:
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        params["modifiedFrom"] = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+    r = await client.get("https://opendata.trudvsem.ru/api/v1/vacancies", params=params)
+    _ok(r)
+    out = []
+    for rec in ((r.json().get("results") or {}).get("vacancies") or []):
+        it = rec.get("vacancy") or {}
+        title = it.get("job-name") or ""
+        # отдельного фильтра удалёнки в этом API нет: смотрим на график работы и название
+        if remote and not re.search(r"удален|дистанц|remote", _norm((it.get("schedule") or "") + " " + title)):
+            continue
+        lo, hi = it.get("salary_min"), it.get("salary_max")
+        out.append(Vacancy(
+            title=title,
+            company=(it.get("company") or {}).get("name") or "",
+            salary=_money(int(lo) if lo else None, int(hi) if hi else None, "руб."),
+            city=(it.get("region") or {}).get("name") or "",
+            url=it.get("vac_url") or "",
+            source="Работа России",
+            published=_parse_dt(it.get("creation-date")),
+        ))
+    return out
+
+
+ALL_SOURCES = {"hh.ru": fetch_hh, "Работа России": fetch_trudvsem,
+               "Habr Career": fetch_habr, "SuperJob": fetch_superjob}
 SOURCES = {n: f for n, f in ALL_SOURCES.items() if n in config.ENABLED_SOURCES}
 if not os.getenv("SUPERJOB_KEY"):  # без ключа SuperJob не подключаем
     SOURCES.pop("SuperJob", None)
