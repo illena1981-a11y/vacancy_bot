@@ -126,9 +126,10 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, remote: bool, da
     ) for it in (r.json().get("objects") or [])]
 
 
-SOURCES = {"hh.ru": fetch_hh, "Habr Career": fetch_habr}
-if os.getenv("SUPERJOB_KEY"):  # без ключа SuperJob не подключаем
-    SOURCES["SuperJob"] = fetch_superjob
+ALL_SOURCES = {"hh.ru": fetch_hh, "Habr Career": fetch_habr, "SuperJob": fetch_superjob}
+SOURCES = {n: f for n, f in ALL_SOURCES.items() if n in config.ENABLED_SOURCES}
+if not os.getenv("SUPERJOB_KEY"):  # без ключа SuperJob не подключаем
+    SOURCES.pop("SuperJob", None)
 
 
 def _parse_dt(s) -> Optional[datetime]:
@@ -176,11 +177,51 @@ def is_excluded(v: Vacancy) -> bool:
     return bool(_EXCLUDE_RE.search(_norm(text)))
 
 
+def _terms(query: str):
+    """Слова запроса -> (основа, точное_совпадение).
+    Для разных форм слова (продаж ~ продажи) берём основу; короткие слова и латиницу сравниваем целиком."""
+    out = []
+    for w in re.findall(r"\w+", _norm(query)):
+        n = len(w)
+        if n <= 2:  # предлоги («по», «of») не учитываем
+            continue
+        if n <= 3 or w.isascii():
+            out.append((w, True))
+        else:
+            out.append((w[: n - 2 if n >= 8 else n - 1], False))
+    return out
+
+
+def matches_query(v: Vacancy, query: str) -> bool:
+    """True, если в названии вакансии есть все слова запроса."""
+    words = re.findall(r"\w+", _norm(v.title))
+    return all(any((w == s) if exact else w.startswith(s) for w in words)
+               for s, exact in _terms(query))
+
+
+async def _run_source(fn, client, queries, remote, days):
+    """Все формулировки для одного сайта, по очереди (чтобы не частить)."""
+    out, last_err, ok = [], None, False
+    for i, q in enumerate(queries):
+        if i:
+            await asyncio.sleep(0.5)
+        try:
+            out += await fn(client, q, remote, days)
+            ok = True
+        except Exception as e:
+            last_err = e
+            log.warning("запрос «%s» не прошёл: %r", q, e)
+    if not ok:
+        raise last_err  # сайт не ответил ни на одну формулировку
+    return out
+
+
 async def collect(query: str, remote: bool = False, use_excludes: bool = True, days: int = 0):
     """Опрашивает все источники параллельно. Возвращает (вакансии, ошибки, скрыто)."""
+    queries = [q.strip() for q in query.split("|") if q.strip()]  # «a | b» — несколько формулировок
     async with httpx.AsyncClient(timeout=15, headers={"User-Agent": UA}) as client:
         results = await asyncio.gather(
-            *(fn(client, query, remote, days) for fn in SOURCES.values()),
+            *(_run_source(fn, client, queries, remote, days) for fn in SOURCES.values()),
             return_exceptions=True,
         )
     cutoff = datetime.now(timezone.utc) - timedelta(days=days) if days else None
@@ -194,6 +235,8 @@ async def collect(query: str, remote: bool = False, use_excludes: bool = True, d
             # страховка: даже если сайт не умеет фильтр по дате, старое отсекаем сами
             if cutoff and v.published and v.published < cutoff:
                 continue
+            if use_excludes and config.STRICT_TITLE and not any(matches_query(v, q) for q in queries):
+                continue  # не по теме: сайт отдал лишнее
             if use_excludes and is_excluded(v):
                 hidden += 1
                 continue
