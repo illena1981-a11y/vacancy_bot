@@ -43,19 +43,28 @@ def _money(a, b, cur) -> str:
     return (" ".join(parts) + f" {cur or ''}").strip() or "не указана"
 
 
+def _ok(r: httpx.Response) -> None:
+    """Ошибка с кодом и началом ответа сайта (видно в логах Actions)."""
+    if r.is_error:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
+
+
 async def fetch_hh(client: httpx.AsyncClient, query: str, remote: bool, days: int = 0):
     params = {"text": query, "per_page": 50, "order_by": "publication_time"}
     if config.TITLE_ONLY:
         params["search_field"] = "name"
     if days:
         params["period"] = min(days, 30)  # hh.ru: максимум 30 дней
-    if remote:
-        params["schedule"] = "remote"
-    r = await client.get("https://api.hh.ru/vacancies", params=params,
-                         headers={"HH-User-Agent": UA})
-    r.raise_for_status()
+    # hh.ru менял название фильтра удалёнки: пробуем новое, затем старое
+    variants = [{"work_format": "REMOTE"}, {"schedule": "remote"}] if remote else [{}]
+    for extra in variants:
+        r = await client.get("https://api.hh.ru/vacancies", params={**params, **extra},
+                             headers={"HH-User-Agent": UA})
+        if r.status_code != 400:
+            break
+    _ok(r)
     out = []
-    for it in r.json().get("items", []):
+    for it in (r.json().get("items") or []):
         s = it.get("salary") or {}
         out.append(Vacancy(
             title=it["name"],
@@ -76,14 +85,14 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, remote: bool, days: 
     if remote:
         params["remote"] = "true"
     r = await client.get("https://career.habr.com/api/frontend/vacancies", params=params)
-    r.raise_for_status()
+    _ok(r)
     out = []
-    for it in r.json().get("list", []):
+    for it in (r.json().get("list") or []):
         out.append(Vacancy(
             title=it.get("title", ""),
             company=(it.get("company") or {}).get("title", ""),
             salary=(it.get("salary") or {}).get("formatted") or "не указана",
-            city=", ".join(l["title"] for l in it.get("locations", [])) or
+            city=", ".join(filter(None, (l.get("title") for l in (it.get("locations") or [])))) or
                  ("Удалённо" if it.get("remoteWork") else ""),
             url="https://career.habr.com" + it.get("href", ""),
             source="Habr Career",
@@ -104,7 +113,7 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, remote: bool, da
     r = await client.get("https://api.superjob.ru/2.0/vacancies/",
                          params=params,
                          headers={"X-Api-App-Id": key})
-    r.raise_for_status()
+    _ok(r)
     return [Vacancy(
         title=it.get("profession", ""),
         company=it.get("firm_name", ""),
@@ -114,10 +123,12 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, remote: bool, da
         source="SuperJob",
         published=(datetime.fromtimestamp(it["date_published"], timezone.utc)
                    if it.get("date_published") else None),
-    ) for it in r.json().get("objects", [])]
+    ) for it in (r.json().get("objects") or [])]
 
 
-SOURCES = {"hh.ru": fetch_hh, "Habr Career": fetch_habr, "SuperJob": fetch_superjob}
+SOURCES = {"hh.ru": fetch_hh, "Habr Career": fetch_habr}
+if os.getenv("SUPERJOB_KEY"):  # без ключа SuperJob не подключаем
+    SOURCES["SuperJob"] = fetch_superjob
 
 
 def _parse_dt(s) -> Optional[datetime]:
