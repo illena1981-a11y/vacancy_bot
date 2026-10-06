@@ -63,8 +63,6 @@ async def fetch(query, remote, use_ex, days):
     items, errors, hidden = await collect(query, remote, use_ex, days)
     if errors:
         print("Не ответили:", ", ".join(errors))
-    if len(errors) == len(SOURCES):
-        sys.exit("Все источники недоступны")  # workflow упадёт, GitHub пришлёт письмо
     return items, errors, hidden
 
 
@@ -83,6 +81,10 @@ async def check():
     query, remote, use_ex, days = common.parse_args("")
     items, errors, _ = await fetch(query, remote, use_ex, days)
     st, now = load_state(), time.time()
+
+    if st is None and len(errors) >= len(SOURCES):  # ничего не получили — базовый список не фиксируем
+        return tg("⚠️ Слежение не запустилось: ни один источник не ответил. "
+                  "Подробности в логах запуска на GitHub (Actions).")
 
     if st is None:  # первый запуск: запоминаем текущее, чат не заваливаем
         save_state({"seen": {k: now for v in items for k in keys(v)}, "failing": sorted(errors)})
