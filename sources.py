@@ -1,6 +1,7 @@
 """Источники вакансий. Каждый сборщик возвращает list[Vacancy].
 Чтобы добавить новый источник: напишите async-функцию и внесите её в SOURCES."""
 import asyncio
+import json
 import logging
 import os
 import re
@@ -133,6 +134,9 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, remote: bool, da
     ) for it in (r.json().get("objects") or [])]
 
 
+_REMOTE_RE = re.compile(r"удаленн|удаленк|дистанцион|remote|на дому")
+
+
 async def fetch_trudvsem(client: httpx.AsyncClient, query: str, remote: bool, days: int = 0):
     """«Работа России» — государственный портал, открытое API без ключа."""
     params = {"text": query, "limit": 100, "offset": 0}
@@ -147,8 +151,9 @@ async def fetch_trudvsem(client: httpx.AsyncClient, query: str, remote: bool, da
     for rec in recs:
         it = rec.get("vacancy") or {}
         title = it.get("job-name") or ""
-        # отдельного фильтра удалёнки в этом API нет: смотрим на график работы и название
-        if remote and not re.search(r"удален|дистанц|remote", _norm((it.get("schedule") or "") + " " + title)):
+        # в API нет признака «удалённая работа» (среди графиков такого значения нет),
+        # поэтому ищем слова про удалёнку по всему тексту вакансии
+        if remote and not _REMOTE_RE.search(_norm(json.dumps(it, ensure_ascii=False))):
             skipped += 1
             continue
         lo, hi = it.get("salary_min"), it.get("salary_max")
